@@ -7,10 +7,6 @@ from datetime import datetime
 from hyvideo.utils.file_utils import save_videos_grid
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
-from hyvideo.modules.attention_tracker import attention_tracker
-from hyvideo.modules.visualization import visualize_attention_for_video
-import numpy as np
-import torch
 
 
 def main():
@@ -54,35 +50,9 @@ def main():
         for i, sample in enumerate(samples):
             sample = samples[i].unsqueeze(0)
             time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")
-            base_name = f"{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/','')}"
-            
-            # Save video
-            video_path = f"{save_path}/{base_name}.mp4"
-            save_videos_grid(sample, video_path, fps=24)
-            logger.info(f'Sample saved to: {video_path}')
-            
-            # If dump_attention flag is set, save attention maps
-            if args.dump_attention:
-                # Extract frames from the video for visualization
-                frames = [np.array(frame) for frame in sample[0]]  # Convert tensor to numpy arrays
-                
-                # Calculate grid shape based on the model's configuration
-                grid_h = args.video_size[0] // 16  # Assuming patch size of 16
-                grid_w = args.video_size[1] // 16
-                
-                # Visualize attention maps for each layer that was tracked
-                for layer_name in attention_tracker.attention_maps.keys():
-                    logger.info(f'Visualizing attention maps for layer: {layer_name}')
-                    visualize_attention_for_video(
-                        attention_tracker,
-                        layer_name,
-                        frames,
-                        grid_shape=(grid_h, grid_w),
-                        head='average'
-                    )
-                
-                # Clear the tracker after visualization
-                attention_tracker.clear()
+            cur_save_path = f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/','')}.mp4"
+            save_videos_grid(sample, cur_save_path, fps=24)
+            logger.info(f'Sample save to: {cur_save_path}')
 
 if __name__ == "__main__":
     main()

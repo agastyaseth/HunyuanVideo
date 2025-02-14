@@ -16,7 +16,6 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
-from hyvideo.modules.custom_attention import CustomSelfAttention, CustomCrossAttention
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -37,6 +36,7 @@ class MMDoubleStreamBlock(nn.Module):
         qkv_bias: bool = False,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        block_idx: int = 0,  # Add block index for naming
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -124,19 +124,8 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
-        # Integrate custom self-attention for double stream block
-        self.custom_self_attn = CustomSelfAttention(
-            embed_dim=hidden_size,
-            num_heads=heads_num,
-            tracker_name="double_stream_self_attn"
-        )
-        
-        # If this block includes cross-attention, integrate custom cross-attention as well
-        self.custom_cross_attn = CustomCrossAttention(
-            embed_dim=hidden_size,
-            num_heads=heads_num,
-            tracker_name="double_stream_cross_attn"
-        )
+        # Store block index for attention map naming
+        self.block_idx = block_idx
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -242,40 +231,60 @@ class MMDoubleStreamBlock(nn.Module):
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1] :]
 
-        # Replace original self-attention call with custom self-attention call
-        self_attn_out = self.custom_self_attn(
-            img_attn,
-            txt_attn,
-            attn_mask=None,
-            drop_rate=0.0,
-            causal=False,
+        # Image self-attention with tracking
+        img_attn = attention(
+            img_q,
+            img_k,
+            img_v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=img.shape[0],
+            tracker_name=f"double_block_{self.block_idx}_img_self_attn"
         )
-        
-        # For cross-attention, if applicable
-        if "q_cross" in locals() and "k_cross" in locals() and "v_cross" in locals():
-            cross_attn_out = self.custom_cross_attn(
-                locals["q_cross"],
-                locals["k_cross"],
-                locals["v_cross"],
-                attn_mask=None,
-                drop_rate=0.0,
-                causal=False,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_kv,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv
-            )
-            # Combine cross-attention output with self-attention output appropriately
-            attn_out = self_attn_out + cross_attn_out
-        else:
-            attn_out = self_attn_out
-        
-        # Apply residual connection and continue with the block's forward pass
-        img = img + apply_gate(self.img_attn_proj(attn_out[:, : img.shape[1]]), gate=img_mod1_gate)
+
+        # Text self-attention with tracking
+        txt_attn = attention(
+            txt_q,
+            txt_k,
+            txt_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=txt.shape[0],
+            tracker_name=f"double_block_{self.block_idx}_txt_self_attn"
+        )
+
+        # Cross attention (img->txt) with tracking
+        img_txt_attn = attention(
+            img_q,
+            txt_k,
+            txt_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=img.shape[0],
+            tracker_name=f"double_block_{self.block_idx}_img_txt_cross_attn"
+        )
+
+        # Cross attention (txt->img) with tracking
+        txt_img_attn = attention(
+            txt_q,
+            img_k,
+            img_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=txt.shape[0],
+            tracker_name=f"double_block_{self.block_idx}_txt_img_cross_attn"
+        )
+
+        # Calculate the img bloks.
+        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
         img = img + apply_gate(
             self.img_mlp(
                 modulate(
@@ -285,7 +294,8 @@ class MMDoubleStreamBlock(nn.Module):
             gate=img_mod2_gate,
         )
 
-        txt = txt + apply_gate(self.txt_attn_proj(attn_out[:, img.shape[1] :]), gate=txt_mod1_gate)
+        # Calculate the txt bloks.
+        txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
         txt = txt + apply_gate(
             self.txt_mlp(
                 modulate(
@@ -317,10 +327,12 @@ class MMSingleStreamBlock(nn.Module):
         qk_scale: float = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        block_idx: int = 0,  # Add block index for naming
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-
+        # Store block index for attention map naming
+        self.block_idx = block_idx
+        
         self.deterministic = False
         self.hidden_size = hidden_size
         self.heads_num = heads_num
@@ -363,13 +375,6 @@ class MMSingleStreamBlock(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
-        # Integrate custom self-attention
-        self.custom_self_attn = CustomSelfAttention(
-            embed_dim=hidden_size,
-            num_heads=heads_num,
-            tracker_name="single_stream_self_attn"
-        )
-
     def enable_deterministic(self):
         self.deterministic = True
 
@@ -411,24 +416,33 @@ class MMSingleStreamBlock(nn.Module):
             q = torch.cat((img_q, txt_q), dim=1)
             k = torch.cat((img_k, txt_k), dim=1)
 
-        # Instead of the original self-attention computation, use our custom self-attention
-        # Passing the computed q, k, v properly
-        attn_out = self.custom_self_attn(
-            q, k, v,
-            attn_mask=None,
-            drop_rate=0.0,
-            causal=False,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv
-        )
-        
-        # Residual connection
-        x = x + attn_out
+        # Compute attention with tracking
+        if not self.hybrid_seq_parallel_attn:
+            attn = attention(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=x.shape[0],
+                tracker_name=f"single_block_{self.block_idx}_unified_attn"
+            )
+        else:
+            attn = parallel_attention(
+                self.hybrid_seq_parallel_attn,
+                q,
+                k,
+                v,
+                img_q_len=img_q.shape[1],
+                img_kv_len=img_k.shape[1],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv
+            )
 
         # Compute activation in mlp stream, cat again and run second linear layer.
-        output = self.linear2(torch.cat((x, self.mlp_act(mlp)), 2))
+        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         return x + apply_gate(output, gate=mod_gate)
 
 
@@ -578,36 +592,38 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             else None
         )
 
-        # double blocks
+        # Initialize double blocks with indices
         self.double_blocks = nn.ModuleList(
             [
                 MMDoubleStreamBlock(
-                    self.hidden_size,
-                    self.heads_num,
+                    hidden_size=hidden_size,
+                    heads_num=heads_num,
                     mlp_width_ratio=mlp_width_ratio,
                     mlp_act_type=mlp_act_type,
                     qk_norm=qk_norm,
                     qk_norm_type=qk_norm_type,
                     qkv_bias=qkv_bias,
                     **factory_kwargs,
+                    block_idx=i
                 )
-                for _ in range(mm_double_blocks_depth)
+                for i in range(mm_double_blocks_depth)
             ]
         )
 
-        # single blocks
+        # Initialize single blocks with indices
         self.single_blocks = nn.ModuleList(
             [
                 MMSingleStreamBlock(
-                    self.hidden_size,
-                    self.heads_num,
+                    hidden_size=hidden_size,
+                    heads_num=heads_num,
                     mlp_width_ratio=mlp_width_ratio,
                     mlp_act_type=mlp_act_type,
                     qk_norm=qk_norm,
                     qk_norm_type=qk_norm_type,
                     **factory_kwargs,
+                    block_idx=i
                 )
-                for _ in range(mm_single_blocks_depth)
+                for i in range(mm_single_blocks_depth)
             ]
         )
 

@@ -142,17 +142,17 @@ def attention(
             else:
                 attn_bias += attn_mask
 
-        # TODO: Maybe force q and k to be float32 to avoid numerical overflow
         attn = (q @ k.transpose(-2, -1)) * scale_factor
         attn += attn_bias
         attn = attn.softmax(dim=-1)
-        attn = torch.dropout(attn, p=drop_rate, train=True)
-
-        # NEW: Store the attention weights if tracker_name is provided
+        
+        # Store attention weights if tracker_name is provided, but don't modify the computation
         if tracker_name is not None:
             from hyvideo.modules.attention_tracker import attention_tracker
-            attention_tracker.add(tracker_name, attn)
-
+            # Store a copy of the attention weights to avoid modifying the computation
+            attention_tracker.add(tracker_name, attn.clone())
+            
+        attn = torch.dropout(attn, p=drop_rate, train=True)
         x = attn @ v
     else:
         raise NotImplementedError(f"Unsupported attention mode: {mode}")
