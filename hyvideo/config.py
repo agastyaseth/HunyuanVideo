@@ -13,6 +13,13 @@ def parse_args(namespace=None):
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
 
+    # Add dump_attention flag
+    parser.add_argument(
+        "--dump_attention",
+        action="store_true",
+        help="Whether to dump attention maps during video sampling"
+    )
+
     args = parser.parse_args(namespace=namespace)
     args = sanity_check_args(args)
 

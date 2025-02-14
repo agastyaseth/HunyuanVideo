@@ -70,6 +70,7 @@ def attention(
     max_seqlen_q=None,
     max_seqlen_kv=None,
     batch_size=1,
+    tracker_name: str = None
 ):
     """
     Perform QKV self attention.
@@ -146,6 +147,12 @@ def attention(
         attn += attn_bias
         attn = attn.softmax(dim=-1)
         attn = torch.dropout(attn, p=drop_rate, train=True)
+
+        # NEW: Store the attention weights if tracker_name is provided
+        if tracker_name is not None:
+            from hyvideo.modules.attention_tracker import attention_tracker
+            attention_tracker.add(tracker_name, attn)
+
         x = attn @ v
     else:
         raise NotImplementedError(f"Unsupported attention mode: {mode}")

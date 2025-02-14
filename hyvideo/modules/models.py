@@ -16,6 +16,7 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+from hyvideo.modules.custom_attention import CustomSelfAttention, CustomCrossAttention
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -123,6 +124,20 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
+        # Integrate custom self-attention for double stream block
+        self.custom_self_attn = CustomSelfAttention(
+            embed_dim=hidden_size,
+            num_heads=heads_num,
+            tracker_name="double_stream_self_attn"
+        )
+        
+        # If this block includes cross-attention, integrate custom cross-attention as well
+        self.custom_cross_attn = CustomCrossAttention(
+            embed_dim=hidden_size,
+            num_heads=heads_num,
+            tracker_name="double_stream_cross_attn"
+        )
+
     def enable_deterministic(self):
         self.deterministic = True
 
@@ -227,8 +242,40 @@ class MMDoubleStreamBlock(nn.Module):
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1] :]
 
-        # Calculate the img bloks.
-        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
+        # Replace original self-attention call with custom self-attention call
+        self_attn_out = self.custom_self_attn(
+            img_attn,
+            txt_attn,
+            attn_mask=None,
+            drop_rate=0.0,
+            causal=False,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv
+        )
+        
+        # For cross-attention, if applicable
+        if "q_cross" in locals() and "k_cross" in locals() and "v_cross" in locals():
+            cross_attn_out = self.custom_cross_attn(
+                locals["q_cross"],
+                locals["k_cross"],
+                locals["v_cross"],
+                attn_mask=None,
+                drop_rate=0.0,
+                causal=False,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv
+            )
+            # Combine cross-attention output with self-attention output appropriately
+            attn_out = self_attn_out + cross_attn_out
+        else:
+            attn_out = self_attn_out
+        
+        # Apply residual connection and continue with the block's forward pass
+        img = img + apply_gate(self.img_attn_proj(attn_out[:, : img.shape[1]]), gate=img_mod1_gate)
         img = img + apply_gate(
             self.img_mlp(
                 modulate(
@@ -238,8 +285,7 @@ class MMDoubleStreamBlock(nn.Module):
             gate=img_mod2_gate,
         )
 
-        # Calculate the txt bloks.
-        txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
+        txt = txt + apply_gate(self.txt_attn_proj(attn_out[:, img.shape[1] :]), gate=txt_mod1_gate)
         txt = txt + apply_gate(
             self.txt_mlp(
                 modulate(
@@ -317,6 +363,13 @@ class MMSingleStreamBlock(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
+        # Integrate custom self-attention
+        self.custom_self_attn = CustomSelfAttention(
+            embed_dim=hidden_size,
+            num_heads=heads_num,
+            tracker_name="single_stream_self_attn"
+        )
+
     def enable_deterministic(self):
         self.deterministic = True
 
@@ -358,38 +411,24 @@ class MMSingleStreamBlock(nn.Module):
             q = torch.cat((img_q, txt_q), dim=1)
             k = torch.cat((img_k, txt_k), dim=1)
 
-        # Compute attention.
-        assert (
-            cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
+        # Instead of the original self-attention computation, use our custom self-attention
+        # Passing the computed q, k, v properly
+        attn_out = self.custom_self_attn(
+            q, k, v,
+            attn_mask=None,
+            drop_rate=0.0,
+            causal=False,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv
+        )
         
-        # attention computation start
-        if not self.hybrid_seq_parallel_attn:
-            attn = attention(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_kv,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
-                batch_size=x.shape[0],
-            )
-        else:
-            attn = parallel_attention(
-                self.hybrid_seq_parallel_attn,
-                q,
-                k,
-                v,
-                img_q_len=img_q.shape[1],
-                img_kv_len=img_k.shape[1],
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_kv
-            )
-        # attention computation end
+        # Residual connection
+        x = x + attn_out
 
         # Compute activation in mlp stream, cat again and run second linear layer.
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        output = self.linear2(torch.cat((x, self.mlp_act(mlp)), 2))
         return x + apply_gate(output, gate=mod_gate)
 
 
